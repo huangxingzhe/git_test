@@ -1,0 +1,76 @@
+
+public class ThreadPoolWrapper {
+	private static final int THREAD_POOL_MAXMUMPOOLSIZE = 200; // 并发线程数
+	private static final int BLOCKING_QUEUE_SIZE = 1024 * 50;  // 队列大小
+	// 计数器
+	private static AtomicInteger T = new AtomicInteger(0);
+
+	// 线程池
+	private static ExecutorService executors;
+
+	/**
+	 * 启动线程池和计数器，并设置计数器每秒输出后清零
+	 * 
+	 */
+	public static void start() {
+		executors = new ThreadPoolExecutor(1, THREAD_POOL_MAXMUMPOOLSIZE, 0l,
+				TimeUnit.SECONDS,
+				new ArrayBlockingQueue<Runnable>(BLOCKING_QUEUE_SIZE),
+				Executors.defaultThreadFactory(),
+				new ThreadPoolExecutor.DiscardPolicy());
+		Timer timer = new Timer();
+		timer.schedule(new TimerTask() {
+			public void run() {
+				System.out.println(T.get()); // XXX 模拟TPS，输出每秒提交的任务数量
+				T.set(0);
+			}
+		}, 1000l, 1000l);
+	}
+
+	/**
+	 * 提交测试任务
+	 * @Description: 提交参数指定的任务并运行，计数器加1
+	 */
+	public static void submit(final Runnable runnable) {
+		executors.submit(new Runnable() {
+			public void run() {
+				try {
+					runnable.run();
+					T.addAndGet(1);
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+			}
+		});
+	}
+
+
+	public static void main(String[] args) {
+		System.out.println("init application context ...");
+		ApplicationContext app = new ClassPathXmlApplicationContext("applicationContext.xml");
+		
+		System.out.println("load service bean ...");
+		final HermoeService svc = (HermoeService)app.getBean("hermoeService");
+		
+		System.out.println("start thread pool ...");
+		ThreadPoolWrapper.start();
+		
+		System.out.println("submit task in loop : ");
+		int index = 0;
+		while (true) {
+		    index ++;
+			ThreadPoolWrapper.submit(new Runnable() {
+				
+				@Override
+				public void run() {
+					try {
+						Result res = svc.query(params);
+//						System.out.println(res.toString());
+					} catch (Exception e) {
+						e.printStackTrace();
+					} 
+				}
+			});
+		}
+	}
+}

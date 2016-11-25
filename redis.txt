@@ -1,0 +1,438 @@
+
+1.主redis provider
+
+import java.io.IOException;
+import java.util.Properties;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.exceptions.JedisException;
+
+public class RedisWriteProvider {
+	private final static Logger log = LoggerFactory.getLogger(RedisWriteProvider.class);
+
+	private final static String MASTER_IP;
+	private final static int MASTER_PORT;
+
+	private final static int POOL_MAX_RETRY_TIME = 3;
+	private final static int POOL_MAX_TOTAL;
+	private final static int POOL_MAX_IDLE;
+	private final static int POOL_MAX_WAIT_MILLIS;
+	private final static int POOL_MIN_IDLE;
+
+
+	/**
+	 * 私有构造器.
+	 */
+	private RedisWriteProvider() {
+
+	}
+
+	/**
+	 * 获取连接池.
+	 * 
+	 * @return 连接池实例
+	 */
+	private static JedisPool getPool() {
+		return RedisProviderHolder.pool;
+	}
+
+	private static class RedisProviderHolder {
+		private static RedisWriteProvider instance = new RedisWriteProvider();
+		private static JedisPool pool = null;
+		static {
+			JedisPoolConfig config = new JedisPoolConfig();
+			config.setMaxTotal(POOL_MAX_TOTAL);
+			config.setMaxIdle(POOL_MAX_IDLE);
+			config.setMaxWaitMillis(POOL_MAX_WAIT_MILLIS);
+			config.setMinIdle(POOL_MIN_IDLE);
+			config.setTestOnBorrow(true); // validate when borrow
+			config.setTestOnReturn(false);
+			try {
+				pool = new JedisPool(config, MASTER_IP, MASTER_PORT);
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+	}
+
+	public static RedisWriteProvider getInstance() {
+		return RedisProviderHolder.instance;
+	}
+
+	/**
+	 * 获取Redis实例.
+	 * 
+	 * @return Redis工具类实例
+	 */
+	public Jedis getJedis() {
+		Jedis jedis = null;
+		int count = 0;
+		do {
+			try {
+				jedis = getPool().getResource();
+			} catch (Exception e) {
+				log.error("get redis master failed [" + count + "]times", e);
+				getPool().returnBrokenResource(jedis);
+			}
+			count++;
+		} while (jedis == null && count < POOL_MAX_RETRY_TIME);
+		return jedis;
+	}
+
+	/**
+	 * 释放redis实例到连接池.
+	 * 
+	 * @param jedis
+	 *            redis实例
+	 */
+	public void returnJedis(Jedis jedis) {
+		if (jedis != null) {
+			try {
+				getPool().returnResource(jedis);
+			} catch (JedisException je) {
+				je.printStackTrace();
+				log.error(" WOOOO return jedis exception here !!!");
+				returnBrokenJedis(jedis);
+			}
+		}
+	}
+
+	public void returnBrokenJedis(Jedis jedis) {
+		if (jedis != null) {
+			getPool().returnBrokenResource(jedis);
+		}
+	}
+
+	public void destroy() {
+		getPool().destroy();
+	}
+}
+
+2.主redis manager
+
+import redis.clients.jedis.Jedis;
+
+public class RedisWriteManager {
+	private boolean cacheSwitch;
+	private int searchSugKeyTTL;
+
+	public void destroy() {
+		RedisWriteProvider.getInstance().destroy();
+	}
+
+	// biz
+	public Jedis getJedis() {
+		Jedis jedis = RedisWriteProvider.getInstance().getJedis();
+		return jedis;
+	}
+
+	public void returnJedis(Jedis jedis) {
+		RedisWriteProvider.getInstance().returnJedis(jedis);
+	}
+
+	public void returnBrokenJedis(Jedis jedis) {
+		RedisWriteProvider.getInstance().returnBrokenJedis(jedis);
+	}
+
+	// getter & setter
+
+	public boolean isCacheSwitch() {
+		return cacheSwitch;
+	}
+
+	public void setCacheSwitch(boolean cacheSwitch) {
+		this.cacheSwitch = cacheSwitch;
+	}
+
+	public int getSearchSugKeyTTL() {
+		return searchSugKeyTTL;
+	}
+
+	public void setSearchSugKeyTTL(int searchSugKeyTTL) {
+		this.searchSugKeyTTL = searchSugKeyTTL;
+	}
+}
+
+
+3.从redis provider
+
+import java.util.LinkedList;
+import java.util.List;
+import java.util.ResourceBundle;
+
+import org.springframework.stereotype.Service;
+
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisShardInfo;
+import redis.clients.jedis.ShardedJedis;
+import redis.clients.jedis.ShardedJedisPool;
+
+@Service("redisShardProvider")
+public class RedisShardProvider {
+
+	private static ShardedJedisPool shardedPool;
+
+	static {
+		ResourceBundle bundle = ResourceBundle.getBundle("config/redis");
+		if (bundle == null) {
+			throw new IllegalArgumentException(
+					"[redis.properties] is not found!");
+		}
+		JedisPoolConfig config = new JedisPoolConfig();
+		config.setMaxTotal(Integer.valueOf(bundle
+				.getString("redis.pool.maxTotal")));
+		config.setMaxIdle(Integer.valueOf(bundle
+				.getString("redis.pool.maxIdle")));
+		config.setMaxWaitMillis(Long.valueOf(bundle
+				.getString("redis.pool.maxWaitMillis")));
+		config.setMinIdle(Integer.valueOf(bundle
+				.getString("redis.pool.minIdle")));
+		config.setTestOnBorrow(Boolean.valueOf(bundle
+				.getString("redis.pool.testOnBorrow")));
+		config.setTestOnReturn(Boolean.valueOf(bundle
+				.getString("redis.pool.testOnReturn")));
+
+		JedisShardInfo jedisShardInfo1 = new JedisShardInfo(
+				bundle.getString("redis1.ip"), Integer.valueOf(bundle
+						.getString("redis1.port")));
+
+		List<JedisShardInfo> list = new LinkedList<JedisShardInfo>();
+		list.add(jedisShardInfo1);
+
+		if (bundle.containsKey("redis2.ip")
+				&& bundle.containsKey("redis2.port")) {
+			JedisShardInfo jedisShardInfo2 = new JedisShardInfo(
+					bundle.getString("redis2.ip"), Integer.valueOf(bundle
+							.getString("redis2.port")));
+			list.add(jedisShardInfo2);
+		}
+		if (bundle.containsKey("redis3.ip")
+				&& bundle.containsKey("redis3.port")) {
+			JedisShardInfo jedisShardInfo3 = new JedisShardInfo(
+					bundle.getString("redis3.ip"), Integer.valueOf(bundle
+							.getString("redis3.port")));
+			list.add(jedisShardInfo3);
+		}
+
+		shardedPool = new ShardedJedisPool(config, list);
+	}
+
+	public static ShardedJedis getJedis() {
+		return shardedPool.getResource();
+	}
+
+	public static void returnJedis(ShardedJedis jedis) {
+		if (jedis != null) {
+			shardedPool.returnResource(jedis);
+		}
+	}
+	
+	public static void returnBrokenJedis(ShardedJedis jedis) {
+		if (jedis != null) {
+			shardedPool.returnBrokenResource(jedis);
+		}
+	}
+
+	public static void destroy() {
+		if (shardedPool != null) {
+			shardedPool.destroy();
+		}
+	}
+
+}
+
+4.从redis manager
+
+import redis.clients.jedis.ShardedJedis;
+
+public class RedisShardManager {
+
+	private boolean cacheSwitch;
+
+	public void destroy() {
+		RedisShardProvider.destroy();
+	}
+
+	// sharded
+	public ShardedJedis getShardedJedis() {
+		ShardedJedis jedis = RedisShardProvider.getJedis();
+		return jedis;
+	}
+
+	public void returnShardedJedis(ShardedJedis jedis) {
+		RedisShardProvider.returnJedis(jedis);
+	}
+	
+	public void returnBrokenShardedJedis(ShardedJedis jedis) {
+		RedisShardProvider.returnJedis(jedis);
+	}
+
+
+	public boolean isCacheSwitch() {
+		return cacheSwitch;
+	}
+
+	public void setCacheSwitch(boolean cacheSwitch) {
+		this.cacheSwitch = cacheSwitch;
+	}
+
+}
+
+
+5.主从读写分离
+import javax.annotation.Resource;
+import org.springframework.stereotype.Service;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.ShardedJedis;
+
+
+
+@Service("redisCacheSvc")
+public class RedisCacheService implements CacheService {
+
+	@Resource
+	private RedisShardManager redisManager;
+
+	@Resource
+	private RedisWriteManager redisWriteManager;
+
+	public RedisShardManager getRedisManager() {
+		return redisManager;
+	}
+
+	public void setRedisManager(RedisShardManager redisManager) {
+		this.redisManager = redisManager;
+	}
+
+	public RedisWriteManager getRedisWriteManager() {
+		return redisWriteManager;
+	}
+
+	public void setRedisWriteManager(RedisWriteManager redisWriteManager) {
+		this.redisWriteManager = redisWriteManager;
+	}
+
+	// config switch 
+	@Override
+	public boolean isCacheReadOpen() {
+		return getRedisManager().isCacheSwitch();
+	}
+
+	@Override
+	public boolean isCacheWriteOpen() {
+		return getRedisWriteManager().isCacheSwitch();
+	}
+
+	// utility
+	public boolean exists(String key){
+		boolean value = false;
+		ShardedJedis jedis = null;
+		try {
+			jedis = redisManager.getShardedJedis();
+			value = jedis.exists(key);
+		} catch (Exception e) {
+			e.printStackTrace();
+			redisManager.returnBrokenShardedJedis(jedis);
+		} finally {
+			redisManager.returnShardedJedis(jedis);
+		}
+		jedis = null;
+		return value;
+	}
+
+	public String get(String key) {
+		String value = null;
+		ShardedJedis jedis = null;
+		try {
+			jedis = redisManager.getShardedJedis();
+			value = jedis.get(key);
+		} catch (Exception e) {
+			e.printStackTrace();
+			redisManager.returnBrokenShardedJedis(jedis);
+		} finally {
+			redisManager.returnShardedJedis(jedis);
+		}
+		jedis = null;
+		return value;
+	}
+
+	@Override
+	public String set(String key, String value) {
+		return set(key, value, null);
+	}
+	
+	@Override
+	public String set(String key, String value,Integer expire) {
+		String newKey = null;
+		Jedis jedis = null;
+		try {
+			jedis = redisWriteManager.getJedis();
+			newKey = jedis.set(key, value);
+			if(expire!=null){
+				jedis.expire(key, expire);
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+			redisWriteManager.returnBrokenJedis(jedis);
+		} finally {
+			redisWriteManager.returnJedis(jedis);
+		}
+		jedis = null;
+		return newKey;
+	}
+	
+
+	@Override
+	public Long delete(String key) {
+		Long d = 0l;
+		Jedis jedis = null;
+		try {
+			jedis = redisWriteManager.getJedis();
+			d = jedis.del(key);
+		} catch (Exception e) {
+			e.printStackTrace();
+			redisWriteManager.returnBrokenJedis(jedis);
+		} finally {
+			redisWriteManager.returnJedis(jedis);
+		}
+		jedis = null;
+		return d;
+	}
+	
+	// hash get & set
+	public String hget(String key,String field){
+		String value = null;
+		ShardedJedis jedis = null;
+		try {
+			jedis = redisManager.getShardedJedis();
+			value = jedis.hget(key,field);
+		} catch (Exception e) {
+			e.printStackTrace();
+			redisManager.returnBrokenShardedJedis(jedis);
+		} finally {
+			redisManager.returnShardedJedis(jedis);
+		}
+		jedis = null;
+		return value;
+	}
+	public Long hset(String key,String field,String value){
+		Long d = 0l;
+		Jedis jedis = null;
+		try {
+			jedis = redisWriteManager.getJedis();
+			d = jedis.hset(key, field, value);
+		} catch (Exception e) {
+			e.printStackTrace();
+			redisWriteManager.returnBrokenJedis(jedis);
+		} finally {
+			redisWriteManager.returnJedis(jedis);
+		}
+		jedis = null;
+		return d;
+	}
+}
